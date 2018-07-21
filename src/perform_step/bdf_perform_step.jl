@@ -454,3 +454,131 @@ function perform_step!(integrator,cache::QNDF2Cache,repeat_step=false)
   cache.newton_iters = iter
   f(integrator.fsallast, u, p, t+dt)
 end
+
+function initialize!(integrator, cache::QNDFConstantCache)
+  integrator.kshortsize = 2
+  integrator.k = typeof(integrator.k)(integrator.kshortsize)
+  integrator.fsalfirst = integrator.f(integrator.uprev, integrator.p, integrator.t) # Pre-start fsal
+
+  # Avoid undefined entries if k is an array of arrays
+  integrator.fsallast = zero(integrator.fsalfirst)
+  integrator.k[1] = integrator.fsalfirst
+  integrator.k[2] = integrator.fsallast
+end
+
+function perform_step!(integrator,cache::QNDFConstantCache,repeat_step=false)
+  @unpack t,dt,uprev,u,f,p = integrator
+  @unpack udiff,dts,k,max_order,D,D2,R,U = cache
+  cnt = integrator.iter
+  κ = integrator.alg.kappa[k]
+  γ = inv((1-κ)*γₖ[k])
+  flag = true
+  for i in 2:k
+    if dts[i] != dts[1]
+      flag = false
+      break
+    end
+  end
+
+  if cnt > 2
+    if flag
+      ρ = dt/dts[1]
+      # backward diff
+      backward_diff(udiff,D,D2,k)
+      if ρ != 1
+        U!(k,U)
+        R!(k,ρ,cache)
+        R .= R * U
+        D .= D * R
+      end
+    else
+      for i = 1:k
+        udiff[i] *= dt/dts[i]
+      end
+      backward_diff(udiff,D,D2,k)
+    end
+  else
+    γ = 1//1
+  end
+  # precalculations
+  u₀ = uprev + sum(D)
+  ϕ = zero(γ)
+  for i in 1:k
+    ϕ += γₖ[k]*D[i]
+  end
+  ϕ *= γ
+  tmp = u₀ - ϕ
+
+  γdt = γ*dt
+  W = calc_W!(integrator, cache, γdt, repeat_step)
+
+  # initial guess
+  z = dt*integrator.fsalfirst
+
+  z, η, iter, fail_convergence = diffeq_nlsolve!(integrator, cache, W, z, tmp, γ, 1, Val{:newton})
+  fail_convergence && return
+  u = tmp + γ*z
+
+  if integrator.opts.adaptive
+    if integrator.success_iter == 0
+      integrator.EEst = one(integrator.EEst)
+    elseif integrator.success_iter == 1
+      utilde = (u - uprev) - (udiff[1] * dt/dtₙ₋₁)
+      atmp = calculate_residuals(utilde, uprev, u, integrator.opts.abstol, integrator.opts.reltol, integrator.opts.internalnorm)
+      integrator.EEst = integrator.opts.internalnorm(atmp)
+    else
+      δ = u - uprev
+      for i = 1:k
+        δ -= δ - D[i]
+      end
+      utilde = (κ*γₖ[k] + inv(k+1)) * δ
+      atmp = calculate_residuals(utilde, uprev, u, integrator.opts.abstol, integrator.opts.reltol, integrator.opts.internalnorm)
+      integrator.EEst = integrator.opts.internalnorm(atmp)
+    end
+    if integrator.EEst > one(integrator.EEst)
+      return
+    end
+
+    if cnt <=  4 || k < 3
+      cache.k = min(k+1,3)
+      if cnt == 1
+        cache.k = 1
+      end
+    else
+      utildem1 = (κ*γₖ[k-1] + inv(k)) * D[k]
+      utildem2 = (κ*γₖ[k-2] + inv(k-1)) * D[k-1]
+      backward_diff(udiff,D,D2,k+1)
+      δ = u - uprev
+      for i = 1:(k+1)
+        δ -= δ - D[i]
+      end
+      utildep1 = (κ*γₖ[k+1] + inv(k+2)) * δ
+      atmpm2 = calculate_residuals(utildem2, uprev, u, integrator.opts.abstol, integrator.opts.reltol, integrator.opts.internalnorm)
+      atmpm1 = calculate_residuals(utildem1, uprev, u, integrator.opts.abstol, integrator.opts.reltol, integrator.opts.internalnorm)
+      atmpp1 = calculate_residuals(utildep1, uprev, u, integrator.opts.abstol, integrator.opts.reltol, integrator.opts.internalnorm)
+      errm2 = integrator.opts.internalnorm(atmpm2)
+      errm1 = integrator.opts.internalnorm(atmpm1)
+      errp1 = integrator.opts.internalnorm(atmpp1)
+      if max(errm2,errm1) <= integrator.EEst
+        cache.k = k - 1
+      elseif errp1 < integrator.EEst
+        cache.k = min(k+1,max_order)
+        integrator.EEst = one(integrator.EEst)   # for keeping the stepsize constant in the next step
+      end # if
+    end # step <= 4
+  end # integrator.opts.adaptive
+
+  for i = 2:5
+    dts[i] = dts[i-1]
+    udiff[i] = udiff[i-1]
+  end
+  dts[1] = dt
+  udiff[1] = u - uprev
+
+  cache.ηold = η
+  cache.newton_iters = iter
+  integrator.fsallast = f(u, p, t+dt)
+  integrator.k[1] = integrator.fsalfirst
+  integrator.k[2] = integrator.fsallast
+  integrator.u = u
+end
